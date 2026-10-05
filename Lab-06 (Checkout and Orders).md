@@ -12,10 +12,10 @@
 |---|---|
 | **Application** | ShopKart |
 | **Lab** | 06 |
-| **Duration** | 2–2.5 Hours |
+| **Duration** | 3 Hours |
 | **Mode** | Individual |
 | **Total Marks** | **100** |
-| **Primary Theme** | Checkout + Order Creation + Business Rules |
+| **Primary Theme** | Checkout + Razorpay Test Payment + Order Creation + Business Rules |
 | **Frontend** | React |
 | **Backend** | Node.js + Express |
 | **Database** | MongoDB |
@@ -75,10 +75,14 @@ flowchart LR
     B --> C[Checkout]
     C --> D[Validate Address]
     D --> E[Verify Stock]
-    E --> F[Create Order]
-    F --> G[Clear Cart]
-    G --> H[Order Success]
-    H --> I[My Orders]
+    E --> F[Create Pending ShopKart Order]
+    F --> G[Create Razorpay Order]
+    G --> H[Open Razorpay Checkout]
+    H --> I[Verify Payment Signature]
+    I --> J[Mark Order Paid]
+    J --> K[Clear Cart]
+    K --> L[Order Success]
+    L --> M[My Orders]
 ```
 
 ### Feature scope
@@ -90,13 +94,18 @@ flowchart LR
 - Order schema
 - Create Order API
 - Order price snapshot
-- Clear cart after successful order
+- Razorpay Test Mode payment integration
+- Server-side Razorpay Order creation
+- Razorpay Checkout on the frontend
+- Mandatory payment-signature verification
+- Payment status persistence
+- Clear cart only after verified payment
 - Order confirmation page
 - My Orders page
 - Protected order APIs
 - Loading, validation and error states
 
-> No real payment gateway is required in this lab.
+> **Payment integration is mandatory in this lab.** Use Razorpay **Test Mode** only. No real money should be used.
 
 ---
 
@@ -183,10 +192,20 @@ const orderSchema = new mongoose.Schema(
       required: true
     },
 
+    paymentStatus: {
+      type: String,
+      enum: ["PENDING", "PAID", "FAILED"],
+      default: "PENDING"
+    },
+
     status: {
       type: String,
-      default: "PLACED"
-    }
+      enum: ["PENDING_PAYMENT", "PLACED", "CONFIRMED", "SHIPPED", "DELIVERED"],
+      default: "PENDING_PAYMENT"
+    },
+
+    razorpayOrderId: String,
+    razorpayPaymentId: String
   },
   { timestamps: true }
 );
@@ -218,7 +237,8 @@ The order represents what the user actually purchased at that time.
 
 | Method | Endpoint | Auth | Purpose |
 |---|---|:---:|---|
-| POST | `/orders` | ✅ | Create order from current cart |
+| POST | `/orders/create-payment-order` | ✅ | Validate cart, create ShopKart pending order and Razorpay Order |
+| POST | `/orders/verify-payment` | ✅ | Verify Razorpay signature and confirm ShopKart order |
 | GET | `/orders` | ✅ | Get current user's orders |
 | GET | `/orders/:id` | ✅ | Get one order |
 
@@ -339,7 +359,7 @@ Do not call the backend if basic client validation fails.
 ### Endpoint
 
 ```http
-POST /orders
+POST /orders/create-payment-order
 ```
 
 ### Request body
@@ -376,9 +396,17 @@ flowchart TD
     F --> G[Verify Stock]
     G --> H[Build Order Snapshot]
     H --> I[Calculate Total on Server]
-    I --> J[Create Order]
-    J --> K[Clear User Cart]
-    K --> L[Return Created Order]
+    I --> J[Create Pending ShopKart Order]
+    J --> K[Create Razorpay Order in Paise]
+    K --> L[Save razorpayOrderId]
+    L --> M[Return Checkout Data]
+
+    N[Payment succeeds in Razorpay Checkout] --> O[POST /orders/verify-payment]
+    O --> P[Verify HMAC SHA256 Signature]
+    P -->|Invalid| Q[400 - Do Not Clear Cart]
+    P -->|Valid| R[Mark Payment PAID + Order PLACED]
+    R --> S[Clear User Cart]
+    S --> T[Return Confirmed Order]
 ```
 
 ---
@@ -482,7 +510,7 @@ Historical snapshot of purchase-time data.
 # 13. 🧹 Task 5 — Clear Cart After Success
 ### **5 Marks**
 
-After the Order is successfully saved:
+After the Razorpay payment signature is successfully verified:
 
 ```js
 user.cart = [];
@@ -490,16 +518,24 @@ user.cart = [];
 
 Save the user.
 
+> Creating a pending order or merely opening Razorpay Checkout is **not** enough to clear the cart.
+
 The frontend must also update its global Cart state.
 
 Expected flow:
 
 ```text
-Place Order
+Pay with Razorpay
     ↓
-POST /orders
+Create Razorpay Order
     ↓
-Order created
+Razorpay Checkout
+    ↓
+Payment succeeds
+    ↓
+Backend verifies signature
+    ↓
+Order becomes PAID / PLACED
     ↓
 Backend cart cleared
     ↓
@@ -658,7 +694,9 @@ A user must never be able to access another user's order by guessing its ID.
 | Product deleted after cart addition | Reject order |
 | Stock becomes insufficient | Reject order |
 | Frontend sends fake total | Ignore it |
-| Order created successfully | Clear cart |
+| Razorpay Order created | Keep cart unchanged |
+| Payment signature invalid | Keep order pending/failed and keep cart |
+| Payment verified successfully | Mark paid and clear cart |
 | Order creation fails | Keep cart unchanged |
 | Product price changes later | Old order price stays unchanged |
 | User requests someone else's order | 404 or 403 |
@@ -682,15 +720,37 @@ Expected:
 400 Bad Request
 ```
 
-### Test 2 — Valid order
+### Test 2 — Create payment order
 
-Expected:
+Call:
 
-```text
-201 Created
+```http
+POST /orders/create-payment-order
 ```
 
-### Test 3 — Confirm cart cleared
+Expected a ShopKart order id, Razorpay order id, amount and currency.
+
+### Test 3 — Cart before payment verification
+
+After creating the Razorpay Order but before verification:
+
+```http
+GET /cart
+```
+
+Expected: cart should still contain its items.
+
+### Test 4 — Verify successful payment
+
+Complete a Test Mode payment and send the returned payment id, Razorpay order id and signature to:
+
+```http
+POST /orders/verify-payment
+```
+
+Expected: paymentStatus = PAID and status = PLACED.
+
+### Test 5 — Confirm cart cleared
 
 ```http
 GET /cart
@@ -698,7 +758,7 @@ GET /cart
 
 Expected empty cart.
 
-### Test 4 — Get Orders
+### Test 6 — Get Orders
 
 ```http
 GET /orders
@@ -706,7 +766,7 @@ GET /orders
 
 Expected newly created order.
 
-### Test 5 — Insufficient stock
+### Test 7 — Insufficient stock
 
 Add quantity greater than available stock and try checkout.
 
@@ -716,7 +776,7 @@ Expected:
 400 Bad Request
 ```
 
-### Test 6 — Fake total sent from frontend
+### Test 8 — Fake total sent from frontend
 
 Send:
 
@@ -728,7 +788,7 @@ Send:
 
 Backend should ignore it and calculate the real total.
 
-### Test 7 — Unauthenticated request
+### Test 9 — Unauthenticated request
 
 Expected:
 
@@ -736,7 +796,7 @@ Expected:
 401 Unauthorized
 ```
 
-### Test 8 — Access another user's order
+### Test 10 — Access another user's order
 
 Expected:
 
@@ -760,6 +820,9 @@ backend/
 ├── controllers/
 │   ├── cart.controller.js
 │   └── order.controller.js
+│
+├── config/
+│   └── razorpay.js
 │
 ├── models/
 │   ├── user.model.js
@@ -820,8 +883,15 @@ You may structure the application differently if responsibilities remain clear.
 - [ ] Stock is verified again
 - [ ] Total is calculated on server
 - [ ] Fake frontend totals are ignored
-- [ ] Order is persisted
-- [ ] Cart clears only after successful order creation
+- [ ] Pending ShopKart order is persisted
+- [ ] Razorpay Order is created on the backend
+- [ ] Amount sent to Razorpay is converted to paise
+- [ ] Razorpay Key Secret never reaches the frontend
+- [ ] Razorpay Checkout opens from the frontend
+- [ ] Successful Checkout response is sent to the backend
+- [ ] Payment signature is verified on the backend
+- [ ] Order becomes PAID only after verification
+- [ ] Cart clears only after successful payment verification
 - [ ] Get Orders API returns current user's orders
 - [ ] Single order API enforces ownership
 
@@ -850,13 +920,14 @@ You may structure the application differently if responsibilities remain clear.
 | Order Model + Snapshot Design | 15 |
 | Checkout Page + Shipping Form | 15 |
 | Form Validation | 10 |
-| Create Order API | 20 |
+| Checkout + Razorpay Order API | 15 |
+| Razorpay Checkout Integration | 15 |
+| Payment Signature Verification | 15 |
 | Stock + Server Total Validation | 10 |
 | Cart Clearing + State Sync | 5 |
-| Order Confirmation | 10 |
-| My Orders API + Page | 10 |
-| Code Quality + Error Handling | 3 |
-| Viva | 2 |
+| Order Confirmation | 5 |
+| My Orders API + Page | 5 |
+| Code Quality + Viva | 5 |
 | **Total** | **100** |
 
 ---
@@ -865,31 +936,41 @@ You may structure the application differently if responsibilities remain clear.
 
 Ask any 5–7 depending on implementation.
 
+### Payments
+
+1. Why must the Razorpay Order be created from the backend?
+2. Why is the Razorpay Key Secret never sent to React?
+3. Why does Razorpay expect INR amounts in paise?
+4. What are `razorpay_order_id`, `razorpay_payment_id` and `razorpay_signature`?
+5. Why is signature verification mandatory?
+6. Why should the cart not be cleared when Checkout merely opens?
+7. What would happen if the client simply sent `paymentSuccess: true`?
+
 ### Orders
 
-1. Why does an Order store product name and price separately from the Product document?
-2. Why should order price not change when product price changes?
-3. What is the difference between Cart data and Order data?
-4. Why should an Order reference the User?
+8. Why does an Order store product name and price separately from the Product document?
+9. Why should order price not change when product price changes?
+10. What is the difference between Cart data and Order data?
+11. Why should an Order reference the User?
 
 ### Security & Business Logic
 
-5. Why should the backend calculate totalAmount?
-6. Why must stock be checked again during checkout?
-7. Why should the frontend not send the final order items as trusted data?
-8. How do you prevent a user from reading someone else's order?
+12. Why should the backend calculate totalAmount?
+13. Why must stock be checked again during checkout?
+14. Why should the frontend not send the final order items as trusted data?
+15. How do you prevent a user from reading someone else's order?
 
 ### State Management
 
-9. Why must global cart state be cleared after order creation?
-10. What happens if the backend order succeeds but frontend state is not updated?
-11. Why should cart remain untouched if order creation fails?
+16. Why must global cart state be cleared after order creation?
+17. What happens if the backend order succeeds but frontend state is not updated?
+18. Why should cart remain untouched if order creation fails?
 
 ### React
 
-12. Where should checkout form state live?
-13. What loading states should exist while placing an order?
-14. What should happen if the cart is empty and a user directly opens `/checkout`?
+19. Where should checkout form state live?
+20. What loading states should exist while placing an order?
+21. What should happen if the cart is empty and a user directly opens `/checkout`?
 
 ---
 
@@ -962,6 +1043,585 @@ order.user === req.user.id
 ```
 
 ---
+
+
+---
+
+# 26. 💳 Mandatory Razorpay Test Mode Integration
+
+This lab must include a working Razorpay Standard Checkout integration using **Test Mode**.
+
+The payment architecture should be:
+
+```text
+React Checkout
+      ↓
+POST /orders/create-payment-order
+      ↓
+Backend validates cart + latest stock + latest prices
+      ↓
+Backend calculates final total
+      ↓
+Backend creates ShopKart Order (PENDING_PAYMENT)
+      ↓
+Backend creates Razorpay Order
+      ↓
+Razorpay order_id returned to React
+      ↓
+React opens Razorpay Checkout
+      ↓
+Test payment
+      ↓
+Razorpay returns:
+payment_id + order_id + signature
+      ↓
+React sends them to /orders/verify-payment
+      ↓
+Backend verifies signature
+      ↓
+PAID + PLACED
+      ↓
+Clear Cart
+      ↓
+Success Page
+```
+
+---
+
+# 27. 🧑‍🏫 Razorpay Integration Guide — Step by Step
+
+## Step 1 — Create a Razorpay Account
+
+Create/login to a Razorpay account and open the Razorpay Dashboard.
+
+Keep the account in **Test Mode** for this lab.
+
+Do not use Live Mode credentials.
+
+---
+
+## Step 2 — Generate Test API Keys
+
+From the Razorpay Dashboard, generate API keys while Test Mode is enabled.
+
+You will receive:
+
+```text
+Key ID
+Key Secret
+```
+
+Example format:
+
+```env
+RAZORPAY_KEY_ID=rzp_test_xxxxxxxxx
+RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxx
+```
+
+### Security rule
+
+`RAZORPAY_KEY_SECRET` belongs **only on the backend**.
+
+Never:
+
+- Put the secret in React
+- Commit it to GitHub
+- Send it in an API response
+- Hardcode it in frontend JavaScript
+
+Add `.env` to `.gitignore`.
+
+---
+
+## Step 3 — Install Razorpay on the Backend
+
+From the backend folder:
+
+```bash
+npm install razorpay
+```
+
+Node's built-in `crypto` module will be used for signature verification.
+
+---
+
+## Step 4 — Add Environment Variables
+
+Backend `.env`:
+
+```env
+RAZORPAY_KEY_ID=rzp_test_xxxxxxxxx
+RAZORPAY_KEY_SECRET=your_test_secret
+```
+
+Restart the backend after changing environment variables.
+
+---
+
+## Step 5 — Create Razorpay Configuration
+
+Example:
+
+```js
+// config/razorpay.js
+
+import Razorpay from "razorpay";
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
+});
+
+export default razorpay;
+```
+
+---
+
+## Step 6 — Extend the ShopKart Order Model
+
+Store payment information with the order:
+
+```js
+paymentStatus: {
+  type: String,
+  enum: ["PENDING", "PAID", "FAILED"],
+  default: "PENDING"
+},
+
+status: {
+  type: String,
+  enum: [
+    "PENDING_PAYMENT",
+    "PLACED",
+    "CONFIRMED",
+    "SHIPPED",
+    "DELIVERED"
+  ],
+  default: "PENDING_PAYMENT"
+},
+
+razorpayOrderId: String,
+razorpayPaymentId: String
+```
+
+Never store the Razorpay Key Secret in MongoDB.
+
+---
+
+## Step 7 — Create the Payment Order API
+
+Create:
+
+```http
+POST /orders/create-payment-order
+```
+
+The frontend sends shipping details.
+
+The backend must:
+
+1. Authenticate the user.
+2. Load the user's cart.
+3. Reject an empty cart.
+4. Load latest Product documents.
+5. Validate stock.
+6. Calculate total on the backend.
+7. Build the order snapshot.
+8. Create a ShopKart order with `PENDING_PAYMENT`.
+9. Create a Razorpay Order.
+10. Save the returned Razorpay Order ID.
+11. Return safe Checkout information.
+
+Example:
+
+```js
+const amountInRupees = totalAmount;
+
+const razorpayOrder = await razorpay.orders.create({
+  amount: Math.round(amountInRupees * 100),
+  currency: "INR",
+  receipt: shopKartOrder._id.toString()
+});
+
+shopKartOrder.razorpayOrderId = razorpayOrder.id;
+await shopKartOrder.save();
+```
+
+### Why multiply by 100?
+
+Razorpay expects the amount in the smallest currency unit.
+
+For INR:
+
+```text
+₹1     → 100 paise
+₹499   → 49900
+₹7497  → 749700
+```
+
+---
+
+## Step 8 — Return Checkout Data
+
+Example response:
+
+```json
+{
+  "success": true,
+  "shopKartOrderId": "67abc123",
+  "razorpayOrderId": "order_ABC123",
+  "amount": 749700,
+  "currency": "INR",
+  "key": "rzp_test_xxxxxxxxx"
+}
+```
+
+The Key ID may be sent to the frontend.
+
+The Key Secret must never be sent.
+
+---
+
+## Step 9 — Load Razorpay Checkout in React
+
+Razorpay Standard Checkout requires its Checkout script.
+
+One simple approach:
+
+```js
+const loadRazorpayScript = () => {
+  return new Promise((resolve) => {
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+
+    document.body.appendChild(script);
+  });
+};
+```
+
+Call it before opening Checkout.
+
+Handle script-load failure instead of assuming `window.Razorpay` always exists.
+
+---
+
+## Step 10 — Open Razorpay Checkout
+
+After receiving the backend response:
+
+```js
+const options = {
+  key: data.key,
+  amount: data.amount,
+  currency: data.currency,
+  name: "ShopKart",
+  description: "ShopKart Order",
+  order_id: data.razorpayOrderId,
+
+  handler: async function (response) {
+    // Do NOT mark payment successful here.
+
+    await verifyPayment({
+      shopKartOrderId: data.shopKartOrderId,
+      razorpay_order_id: response.razorpay_order_id,
+      razorpay_payment_id: response.razorpay_payment_id,
+      razorpay_signature: response.razorpay_signature
+    });
+  },
+
+  prefill: {
+    name: shippingAddress.fullName,
+    contact: shippingAddress.phone
+  },
+
+  theme: {}
+};
+
+const paymentObject = new window.Razorpay(options);
+
+paymentObject.on("payment.failed", function (response) {
+  console.error("Payment failed", response.error);
+});
+
+paymentObject.open();
+```
+
+### Critical idea
+
+This callback:
+
+```js
+handler(response)
+```
+
+does **not** mean:
+
+```text
+Trust the browser → payment is valid
+```
+
+It means:
+
+```text
+Send the returned payment details to your backend for verification.
+```
+
+---
+
+## Step 11 — Create Payment Verification API
+
+Create:
+
+```http
+POST /orders/verify-payment
+```
+
+Request:
+
+```json
+{
+  "shopKartOrderId": "67abc123",
+  "razorpay_order_id": "order_ABC123",
+  "razorpay_payment_id": "pay_XYZ123",
+  "razorpay_signature": "signature_here"
+}
+```
+
+---
+
+## Step 12 — Verify Razorpay Signature
+
+Use Node's built-in `crypto` module.
+
+```js
+import crypto from "crypto";
+
+const body =
+  order.razorpayOrderId + "|" + razorpay_payment_id;
+
+const expectedSignature = crypto
+  .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+  .update(body)
+  .digest("hex");
+
+if (expectedSignature !== razorpay_signature) {
+  return res.status(400).json({
+    success: false,
+    message: "Invalid payment signature"
+  });
+}
+```
+
+### Important
+
+Use the Razorpay Order ID stored in your database as the trusted order id for signature generation.
+
+Do not blindly trust an order id supplied by the browser.
+
+---
+
+## Step 13 — Confirm the Order
+
+Only after signature verification succeeds:
+
+```js
+order.paymentStatus = "PAID";
+order.status = "PLACED";
+order.razorpayPaymentId = razorpay_payment_id;
+
+await order.save();
+```
+
+Then clear the user's cart:
+
+```js
+user.cart = [];
+await user.save();
+```
+
+Return the confirmed order.
+
+---
+
+## Step 14 — Update Frontend State
+
+After `/orders/verify-payment` succeeds:
+
+```text
+Redux / Context cart = []
+Navbar → Cart (0)
+Navigate → Order Success
+```
+
+Do not wait for a page refresh to fix the cart count.
+
+---
+
+## Step 15 — Handle Payment Failure
+
+Listen for:
+
+```js
+paymentObject.on("payment.failed", ...)
+```
+
+Display a useful message:
+
+```text
+Payment failed.
+
+Your cart has not been cleared.
+Please try again.
+```
+
+A failed payment must not create a completed ShopKart order.
+
+The pending order may remain `PENDING` or be updated to `FAILED` depending on your implementation.
+
+---
+
+## Step 16 — Test the Complete Flow
+
+Use Razorpay Test Mode only.
+
+Test:
+
+```text
+Login
+  ↓
+Add Product
+  ↓
+Cart
+  ↓
+Checkout
+  ↓
+Shipping Address
+  ↓
+Pay with Razorpay
+  ↓
+Razorpay Test Checkout
+  ↓
+Successful Test Payment
+  ↓
+Signature Verification
+  ↓
+Order PLACED
+  ↓
+Cart (0)
+  ↓
+My Orders
+```
+
+Also deliberately test a failed payment.
+
+No real money should be deducted in Test Mode.
+
+---
+
+# 28. 🔐 Payment Security Rules
+
+Students must follow all of these:
+
+- Never expose `RAZORPAY_KEY_SECRET`.
+- Never trust the total received from React.
+- Never trust a client-side `paymentSuccess` boolean.
+- Never mark an order PAID before signature verification.
+- Never clear the cart before payment verification.
+- Never use the browser-provided order id as the only trusted source during HMAC verification.
+- Never commit API secrets to GitHub.
+- Calculate amount using current Product data on the backend.
+- Store payment identifiers, not card details.
+- Do not build your own card-number/CVV form.
+
+---
+
+# 29. 🧪 Razorpay-Specific Evaluation Tests
+
+### Test A — Manipulated frontend amount
+
+Change the amount in React DevTools.
+
+Expected:
+
+```text
+Backend-generated Razorpay amount remains correct.
+```
+
+### Test B — Fake payment verification
+
+Call `/orders/verify-payment` with a fake signature.
+
+Expected:
+
+```text
+400 Invalid payment signature
+Order must NOT become PAID
+Cart must NOT clear
+```
+
+### Test C — Valid Test Mode payment
+
+Expected:
+
+```text
+paymentStatus = PAID
+status = PLACED
+razorpayPaymentId stored
+cart cleared
+```
+
+### Test D — Payment failure
+
+Expected:
+
+```text
+Error shown
+Cart preserved
+No successful order confirmation
+```
+
+### Test E — Refresh My Orders
+
+The paid order must still appear because it is persisted in MongoDB.
+
+---
+
+# 30. 🏁 Final ShopKart Architecture
+
+```text
+Authentication
+      ↓
+Product Catalogue
+      ↓
+Wishlist
+      ↓
+Shopping Cart
+      ↓
+Global State
+      ↓
+Checkout Form
+      ↓
+Backend Price + Stock Validation
+      ↓
+ShopKart Pending Order
+      ↓
+Razorpay Orders API
+      ↓
+Razorpay Test Checkout
+      ↓
+Payment Signature Verification
+      ↓
+PAID / PLACED Order
+      ↓
+Clear Cart
+      ↓
+Order History
+```
+
+This completes the end-to-end MERN commerce journey: **browse → save → cart → checkout → payment → verification → order history**.
 
 # 26. 🌟 Bonus Challenge (+10 Marks)
 
